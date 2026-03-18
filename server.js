@@ -71,7 +71,7 @@ async function fetchMarketData() {
     const SYMBOL_NAMES = {
       '^KS11': 'KOSPI', '^KQ11': 'KOSDAQ',
       '005930.KS': '삼성전자', '000660.KS': 'SK하이닉스',
-      '373220.KS': 'LG에너지솔루션', '005380.KS': '현대차',
+      '373220.KS': 'LG에솔', '005380.KS': '현대차',
       '035420.KS': 'NAVER', '035720.KS': '카카오', '006400.KS': '삼성SDI'
     };
     marketCache = symbols.map(sym => {
@@ -188,7 +188,7 @@ async function fetchAllNews() {
   console.log('새 데이터 확인 중...');
 
   const { data: existingArticles } = await supabase
-    .from('articles')
+    .from('kr_articles')
     .select('url');
 
   const existingUrls = new Set((existingArticles || []).map(a => a.url));
@@ -233,10 +233,10 @@ async function fetchAllNews() {
           score,
           signal,
           tags,
-          pub_date: item.pubDate
+          pub_date: item.pubDate || item.isoDate || new Date().toISOString()
         };
 
-        await supabase.from('articles').insert(newArticle);
+        await supabase.from('kr_articles').insert(newArticle);
         console.log(`DB 저장 완료: ${item.title}`);
 
         newItems.push({
@@ -244,7 +244,7 @@ async function fetchAllNews() {
           koreanTitle: item.title,
           summary,
           link: item.link,
-          date: item.pubDate,
+          date: item.pubDate || item.isoDate || new Date().toISOString(),
           source: source.name,
           score,
           signal,
@@ -257,7 +257,7 @@ async function fetchAllNews() {
   }
 
   const { data: allArticles } = await supabase
-    .from('articles')
+    .from('kr_articles')
     .select('*')
     .order('score', { ascending: false })
     .order('pub_date', { ascending: false })
@@ -289,7 +289,7 @@ async function generateDailyBrief(news) {
   const today = new Date().toISOString().split('T')[0];
 
   const { data: existing } = await supabase
-    .from('briefs')
+    .from('kr_briefs')
     .select('*')
     .eq('brief_date', today)
     .single();
@@ -333,7 +333,7 @@ ${articleSummaries}
   const pick3 = briefLines.find(l => l.startsWith('픽3:'))?.replace('픽3:', '').trim();
   const picks = [pick1, pick2, pick3].filter(Boolean);
 
-  await supabase.from('briefs').upsert({
+  await supabase.from('kr_briefs').upsert({
     brief_date: today,
     brief_text: briefText,
     picks,
@@ -359,6 +359,26 @@ const TRACKED_CORPS = {
   '00126362': { name: '삼성SDI', ticker: '006400' }
 };
 
+async function summarizeDart(company, title) {
+  try {
+    const message = await client.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 80,
+      messages: [{
+        role: 'user',
+        content: `DART 공시 제목: "${company} - ${title}"
+
+이 공시 유형이 투자자에게 어떤 의미인지 한 줄(30자 이내)로 설명해줘.
+공시 내용을 추측하지 말고, 이 유형의 공시가 일반적으로 뜻하는 바를 설명해.
+"죄송" 같은 말 없이 설명만 출력해.`
+      }]
+    });
+    return message.content[0].text.trim();
+  } catch (e) {
+    return '';
+  }
+}
+
 async function fetchDartDisclosures() {
   const now = Date.now();
   if (dartLastFetched && now - dartLastFetched < DART_CACHE_DURATION && dartCache) {
@@ -377,7 +397,7 @@ async function fetchDartDisclosures() {
     for (const [corpCode, info] of Object.entries(TRACKED_CORPS)) {
       try {
         const response = await axios.get(
-          `https://opendart.fss.or.kr/api/list.json?crtfc_key=${dartApiKey}&corp_code=${corpCode}&bgn_de=${getDateStr(-30)}&end_de=${getDateStr(0)}&page_count=5`,
+          `https://opendart.fss.or.kr/api/list.json?crtfc_key=${dartApiKey}&corp_code=${corpCode}&bgn_de=${getDateStr(-30)}&end_de=${getDateStr(0)}&page_count=3`,
           { headers: { 'User-Agent': 'KRStockNews/1.0' } }
         );
 
@@ -389,6 +409,7 @@ async function fetchDartDisclosures() {
             title: item.report_nm,
             date: item.rcept_dt,
             type: item.pblntf_ty,
+            rceptNo: item.rcept_no,
             url: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${item.rcept_no}`
           });
         }
@@ -397,7 +418,16 @@ async function fetchDartDisclosures() {
       }
     }
 
-    dartCache = disclosures.sort((a, b) => b.date.localeCompare(a.date)).slice(0, 20);
+    // 최신순 정렬 후 상위 15개만
+    const sorted = disclosures.sort((a, b) => b.date.localeCompare(a.date)).slice(0, 15);
+
+    // 상위 10개에 한 줄 요약 추가
+    for (const d of sorted.slice(0, 10)) {
+      console.log(`공시 요약 중: ${d.company} - ${d.title}`);
+      d.summary = await summarizeDart(d.company, d.title);
+    }
+
+    dartCache = sorted;
     dartLastFetched = now;
     return dartCache;
   } catch (e) {
@@ -452,8 +482,9 @@ async function autoRefresh() {
 }
 
 if (!IS_VERCEL) {
-  app.listen(3000, async () => {
-    console.log('서버 실행 중 → http://localhost:3000');
+  const port = process.env.PORT || 3000;
+  app.listen(port, async () => {
+    console.log(`서버 실행 중 → http://localhost:${port}`);
     await fetchAllNews();
     setInterval(autoRefresh, CACHE_DURATION);
   });

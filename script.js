@@ -251,6 +251,7 @@ async function loadDart() {
       <div class="insider-detail">
         <a href="${d.url}" target="_blank" class="dart-title">${d.title}</a>
       </div>
+      ${d.summary ? `<div class="dart-summary">${d.summary}</div>` : ''}
     </div>
   `).join('');
 }
