@@ -359,19 +359,72 @@ const TRACKED_CORPS = {
   '00126362': { name: '삼성SDI', ticker: '006400' }
 };
 
-async function summarizeDart(company, title) {
+async function fetchDartDocument(rceptNo) {
   try {
+    const cleanRceptNo = String(rceptNo).trim();
+    // 1) DART 메인 페이지에서 본문 섹션 정보 추출
+    const mainRes = await axios.get(
+      `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${cleanRceptNo}`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 }
+    );
+    const html = mainRes.data;
+    // treeData에서 두 번째 노드(본문)의 파라미터 추출
+    const nodeRegex = /node1\['text'\]\s*=\s*"([^"]+)"[\s\S]*?node1\['dcmNo'\]\s*=\s*"(\d+)"[\s\S]*?node1\['eleId'\]\s*=\s*"(\d+)"[\s\S]*?node1\['offset'\]\s*=\s*"(\d+)"[\s\S]*?node1\['length'\]\s*=\s*"(\d+)"[\s\S]*?node1\['dtd'\]\s*=\s*"([^"]+)"/g;
+    const nodes = [];
+    let match;
+    while ((match = nodeRegex.exec(html)) !== null) {
+      nodes.push({ text: match[1], dcmNo: match[2], eleId: match[3], offset: match[4], length: match[5], dtd: match[6] });
+    }
+    if (nodes.length === 0) return '';
+    // 표지/헤더가 아닌 실제 본문 노드 찾기 (가장 큰 length 우선)
+    const skipPatterns = /대표이사|확인서|표지|목차|이사회의사록|증빙서류|주요사항보고서|사\s*업\s*보\s*고\s*서|감\s*사\s*보\s*고\s*서|첨부/;
+    const candidates = nodes.filter(n => !skipPatterns.test(n.text) && parseInt(n.length) > 500);
+    // length가 가장 큰 노드 선택 (실제 본문일 확률 높음)
+    const contentNode = candidates.sort((a, b) => parseInt(b.length) - parseInt(a.length))[0]
+      || nodes.find(n => parseInt(n.length) > 1000)
+      || nodes[Math.min(1, nodes.length - 1)];
+
+    // 2) viewer에서 본문 텍스트 가져오기
+    const viewerUrl = `https://dart.fss.or.kr/report/viewer.do?rcpNo=${cleanRceptNo}&dcmNo=${contentNode.dcmNo}&eleId=${contentNode.eleId}&offset=${contentNode.offset}&length=${contentNode.length}&dtd=${contentNode.dtd}`;
+    const viewerRes = await axios.get(viewerUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 });
+    const text = viewerRes.data
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&[a-z]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    console.log(`DART 문서 텍스트: ${contentNode.text} (${text.length}자)`);
+    return text.slice(0, 3000);
+  } catch (e) {
+    console.log(`DART 문서 조회 실패: ${e.message}`);
+    return '';
+  }
+}
+
+async function summarizeDart(company, title, rceptNo) {
+  try {
+    const docText = await fetchDartDocument(rceptNo);
+
+    const prompt = docText
+      ? `회사: ${company}
+공시제목: ${title}
+공시본문(일부): ${docText}
+
+위 DART 공시의 핵심 내용을 투자자 관점에서 한 줄(50자 이내)로 요약해줘.
+구체적인 수치(금액, 주수, 비율 등)가 있으면 반드시 포함해.
+"~입니다", "~됩니다" 같은 어미 없이 간결한 명사형으로 끝내.
+예시: "자기주식 500만주 처분 결정, 약 3,500억원 규모"
+예시: "2025년 매출 162조원, 영업이익 14.6조원 달성"
+설명만 출력해.`
+      : `회사: ${company}
+공시제목: ${title}
+
+위 DART 공시 제목을 투자자가 이해하기 쉽게 한 줄(40자 이내)로 풀어써줘.
+간결한 명사형으로 끝내. 설명만 출력해.`;
+
     const message = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
-      max_tokens: 80,
-      messages: [{
-        role: 'user',
-        content: `DART 공시 제목: "${company} - ${title}"
-
-이 공시 유형이 투자자에게 어떤 의미인지 한 줄(30자 이내)로 설명해줘.
-공시 내용을 추측하지 말고, 이 유형의 공시가 일반적으로 뜻하는 바를 설명해.
-"죄송" 같은 말 없이 설명만 출력해.`
-      }]
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }]
     });
     return message.content[0].text.trim();
   } catch (e) {
@@ -409,7 +462,7 @@ async function fetchDartDisclosures() {
             title: item.report_nm,
             date: item.rcept_dt,
             type: item.pblntf_ty,
-            rceptNo: item.rcept_no,
+            rceptNo: String(item.rcept_no).trim(),
             url: `https://dart.fss.or.kr/dsaf001/main.do?rcpNo=${item.rcept_no}`
           });
         }
@@ -424,7 +477,7 @@ async function fetchDartDisclosures() {
     // 상위 10개에 한 줄 요약 추가
     for (const d of sorted.slice(0, 10)) {
       console.log(`공시 요약 중: ${d.company} - ${d.title}`);
-      d.summary = await summarizeDart(d.company, d.title);
+      d.summary = await summarizeDart(d.company, d.title, d.rceptNo);
     }
 
     dartCache = sorted;
